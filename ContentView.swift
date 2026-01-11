@@ -6,15 +6,21 @@ struct Book: Identifiable, Codable {
     let id: UUID
     var title: String
     var words: [String]
+    var arabicWords: [String]? // For dual-language books like Quran
     var currentWordIndex: Int
     var wordsPerMinute: Double
     var thumbnailData: Data?
     var dateAdded: Date
 
-    init(id: UUID = UUID(), title: String, words: [String], currentWordIndex: Int = 0, wordsPerMinute: Double = 250, thumbnailData: Data? = nil) {
+    var isDualLanguage: Bool {
+        arabicWords != nil && !arabicWords!.isEmpty
+    }
+
+    init(id: UUID = UUID(), title: String, words: [String], arabicWords: [String]? = nil, currentWordIndex: Int = 0, wordsPerMinute: Double = 250, thumbnailData: Data? = nil) {
         self.id = id
         self.title = title
         self.words = words
+        self.arabicWords = arabicWords
         self.currentWordIndex = currentWordIndex
         self.wordsPerMinute = wordsPerMinute
         self.thumbnailData = thumbnailData
@@ -88,12 +94,38 @@ struct ReaderView: View {
                 Spacer()
 
                 if let currentBook = book, !currentBook.words.isEmpty {
-                    Text(currentBook.words[currentBook.currentWordIndex])
-                        .font(.system(size: 64, weight: .light, design: .monospaced))
-                        .tracking(1)
-                        .minimumScaleFactor(0.3)
-                        .lineLimit(1)
-                        .padding(.horizontal, 40)
+                    if currentBook.isDualLanguage {
+                        // Dual language display (Quran): English top, Arabic bottom
+                        VStack(spacing: 20) {
+                            Text(currentBook.words[currentBook.currentWordIndex])
+                                .font(.system(size: 48, weight: .light, design: .default))
+                                .tracking(1)
+                                .minimumScaleFactor(0.3)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 40)
+
+                            if let arabicWords = currentBook.arabicWords,
+                               currentBook.currentWordIndex < arabicWords.count {
+                                Text(arabicWords[currentBook.currentWordIndex])
+                                    .font(.system(size: 48, weight: .regular, design: .default))
+                                    .tracking(1)
+                                    .minimumScaleFactor(0.3)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.center)
+                                    .padding(.horizontal, 40)
+                                    .environment(\.layoutDirection, .rightToLeft)
+                            }
+                        }
+                    } else {
+                        // Single language display
+                        Text(currentBook.words[currentBook.currentWordIndex])
+                            .font(.system(size: 64, weight: .light, design: .monospaced))
+                            .tracking(1)
+                            .minimumScaleFactor(0.3)
+                            .lineLimit(1)
+                            .padding(.horizontal, 40)
+                    }
                 } else {
                     Text("Upload a PDF to begin")
                         .font(.title3)
@@ -170,9 +202,23 @@ struct ReaderView: View {
             }
         }
 
-        let extractedWords = extractedText
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
+        // Check if this is a Quran/dual-language book
+        let isQuranBook = fileName.lowercased().contains("quran") || fileName.lowercased().contains("qur")
+
+        var extractedWords: [String]
+        var arabicWords: [String]?
+
+        if isQuranBook {
+            // Separate English and Arabic words
+            let (english, arabic) = separateLanguages(from: extractedText)
+            extractedWords = english
+            arabicWords = arabic
+        } else {
+            // Regular single-language extraction
+            extractedWords = extractedText
+                .components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+        }
 
         var thumbnailData: Data?
         if let firstPage = pdfDocument.page(at: 0) {
@@ -193,6 +239,7 @@ struct ReaderView: View {
         let newBook = Book(
             title: fileName,
             words: extractedWords,
+            arabicWords: arabicWords,
             currentWordIndex: 0,
             wordsPerMinute: 250,
             thumbnailData: thumbnailData
@@ -204,6 +251,39 @@ struct ReaderView: View {
         timer?.invalidate()
 
         saveBooks()
+    }
+
+    private func separateLanguages(from text: String) -> ([String], [String]) {
+        let allWords = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+
+        var englishWords: [String] = []
+        var arabicWords: [String] = []
+
+        for word in allWords {
+            // Check if word contains Arabic characters (Unicode range U+0600 to U+06FF)
+            let hasArabic = word.unicodeScalars.contains { scalar in
+                (0x0600...0x06FF).contains(scalar.value)
+            }
+
+            if hasArabic {
+                arabicWords.append(word)
+            } else {
+                englishWords.append(word)
+            }
+        }
+
+        // Ensure both arrays have the same length by padding the shorter one
+        let maxLength = max(englishWords.count, arabicWords.count)
+        while englishWords.count < maxLength {
+            englishWords.append("")
+        }
+        while arabicWords.count < maxLength {
+            arabicWords.append("")
+        }
+
+        return (englishWords, arabicWords)
     }
 
     private func togglePlayback() {
@@ -263,46 +343,137 @@ struct ReaderView: View {
     }
 }
 
+enum SortOption: String, CaseIterable {
+    case dateAdded = "Date Added"
+    case title = "Title"
+    case progress = "Progress"
+}
+
 struct BookLibraryView: View {
     @Binding var books: [Book]
     @Binding var currentBook: Book?
     @Binding var selectedTab: Int
+
+    @State private var searchText = ""
+    @State private var sortOption: SortOption = .dateAdded
+    @State private var showingSortMenu = false
 
     let columns = [
         GridItem(.flexible()),
         GridItem(.flexible())
     ]
 
+    var filteredAndSortedBooks: [Book] {
+        let filtered = searchText.isEmpty ? books : books.filter { book in
+            book.title.localizedCaseInsensitiveContains(searchText)
+        }
+
+        switch sortOption {
+        case .dateAdded:
+            return filtered.sorted { $0.dateAdded > $1.dateAdded }
+        case .title:
+            return filtered.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .progress:
+            return filtered.sorted {
+                let progress1 = Double($0.currentWordIndex) / Double($0.words.count)
+                let progress2 = Double($1.currentWordIndex) / Double($1.words.count)
+                return progress1 > progress2
+            }
+        }
+    }
+
     var body: some View {
         NavigationView {
-            ScrollView {
-                if books.isEmpty {
-                    VStack(spacing: 20) {
-                        Spacer()
-                        Image(systemName: "books.vertical")
-                            .font(.system(size: 60))
-                            .foregroundColor(.secondary)
-                        Text("No books yet")
-                            .font(.title2)
-                            .foregroundColor(.secondary)
-                        Text("Swipe right to add a book")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                        Spacer()
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding()
-                } else {
-                    LazyVGrid(columns: columns, spacing: 20) {
-                        ForEach(books) { book in
-                            BookCardView(book: book)
-                                .onTapGesture {
-                                    currentBook = book
-                                    selectedTab = 1
-                                }
+            VStack(spacing: 0) {
+                // Search bar
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("Search books", text: $searchText)
+                        .textFieldStyle(.plain)
+
+                    if !searchText.isEmpty {
+                        Button(action: { searchText = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
                         }
                     }
-                    .padding()
+                }
+                .padding(12)
+                .background(Color(.systemGray6))
+                .cornerRadius(10)
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                // Sort options
+                if !books.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 12) {
+                            ForEach(SortOption.allCases, id: \.self) { option in
+                                Button(action: {
+                                    sortOption = option
+                                }) {
+                                    Text(option.rawValue)
+                                        .font(.subheadline)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 8)
+                                        .background(sortOption == option ? Color.blue : Color(.systemGray5))
+                                        .foregroundColor(sortOption == option ? .white : .primary)
+                                        .cornerRadius(20)
+                                }
+                            }
+                        }
+                        .padding(.horizontal)
+                        .padding(.vertical, 12)
+                    }
+                }
+
+                // Books grid
+                ScrollView {
+                    if books.isEmpty {
+                        VStack(spacing: 20) {
+                            Spacer()
+                            Image(systemName: "books.vertical")
+                                .font(.system(size: 60))
+                                .foregroundColor(.secondary)
+                            Text("No books yet")
+                                .font(.title2)
+                                .foregroundColor(.secondary)
+                            Text("Swipe right to add a book")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding()
+                    } else if filteredAndSortedBooks.isEmpty {
+                        VStack(spacing: 20) {
+                            Spacer()
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 60))
+                                .foregroundColor(.secondary)
+                            Text("No books found")
+                                .font(.title2)
+                                .foregroundColor(.secondary)
+                            Text("Try a different search")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding()
+                    } else {
+                        LazyVGrid(columns: columns, spacing: 20) {
+                            ForEach(filteredAndSortedBooks) { book in
+                                BookCardView(book: book)
+                                    .onTapGesture {
+                                        currentBook = book
+                                        selectedTab = 1
+                                    }
+                            }
+                        }
+                        .padding()
+                    }
                 }
             }
             .navigationTitle("Books")
@@ -314,33 +485,85 @@ struct BookLibraryView: View {
 struct BookCardView: View {
     let book: Book
 
+    var progressPercentage: Double {
+        guard !book.words.isEmpty else { return 0 }
+        return Double(book.currentWordIndex) / Double(book.words.count) * 100
+    }
+
     var body: some View {
         VStack(spacing: 12) {
-            if let thumbnailData = book.thumbnailData,
-               let uiImage = UIImage(data: thumbnailData) {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(height: 220)
-                    .clipped()
-                    .cornerRadius(12)
-            } else {
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.gray.opacity(0.3))
-                    .frame(height: 220)
-                    .overlay(
-                        Image(systemName: "doc.text")
-                            .font(.system(size: 40))
-                            .foregroundColor(.secondary)
-                    )
+            ZStack(alignment: .bottomLeading) {
+                if let thumbnailData = book.thumbnailData,
+                   let uiImage = UIImage(data: thumbnailData) {
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(height: 220)
+                        .clipped()
+                        .cornerRadius(12)
+                } else {
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(height: 220)
+                        .overlay(
+                            Image(systemName: "doc.text")
+                                .font(.system(size: 40))
+                                .foregroundColor(.secondary)
+                        )
+                }
+
+                // Progress indicator
+                VStack(spacing: 4) {
+                    if book.isDualLanguage {
+                        HStack(spacing: 4) {
+                            Image(systemName: "book.pages")
+                                .font(.system(size: 10))
+                            Text("Quran")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(6)
+                    }
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "chart.bar.fill")
+                            .font(.system(size: 10))
+                        Text(String(format: "%.0f%%", progressPercentage))
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(6)
+                }
+                .padding(8)
             }
 
-            Text(book.title)
-                .font(.subheadline)
-                .fontWeight(.medium)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
+            VStack(spacing: 4) {
+                Text(book.title)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+
+                // Progress bar
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Rectangle()
+                            .fill(Color.gray.opacity(0.2))
+                            .frame(height: 3)
+
+                        Rectangle()
+                            .fill(Color.blue)
+                            .frame(width: geometry.size.width * (progressPercentage / 100), height: 3)
+                    }
+                    .cornerRadius(1.5)
+                }
+                .frame(height: 3)
+            }
         }
     }
 }
